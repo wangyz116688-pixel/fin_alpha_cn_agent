@@ -59,6 +59,9 @@ reference/
 docs/
 structure.drawio
 
+# Internal dev guide (not for external submission)
+DEV_GUIDE.md
+
 # Generated cache/database
 data/
 

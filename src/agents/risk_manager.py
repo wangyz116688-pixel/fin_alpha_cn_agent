@@ -1,4 +1,5 @@
 import math
+from typing import List, Dict, Optional
 
 from langchain_core.messages import HumanMessage
 
@@ -220,3 +221,26 @@ def risk_management_agent(state: AgentState):
         },
         "metadata": state["metadata"],
     }
+
+
+# ---------------------------------------------------------------------------
+# 新增：候选池排序（按 DEV_GUIDE 并行化改造）
+# ---------------------------------------------------------------------------
+
+def compute_c_mixed(bull_confidence, bear_confidence, c_llm):
+    """Calculate C_mixed = 0.6 * C_raw + 0.4 * C_llm."""
+    c_raw = (bull_confidence - bear_confidence + 1.0) / 2.0
+    return round(0.6 * c_raw + 0.4 * c_llm, 3)
+
+
+def rank_candidates_by_cmixed(candidates, min_c_mixed=0.55, max_holdings=5):
+    """Rank candidates by C_mixed descending, filter below threshold."""
+    for c in candidates:
+        if "C_mixed" not in c or c["C_mixed"] is None:
+            bull = c.get("bull_confidence", 0.5)
+            bear = c.get("bear_confidence", 0.5)
+            c_llm = c.get("C_llm", 0.5)
+            c["C_mixed"] = compute_c_mixed(bull, bear, c_llm)
+    qualified = [c for c in candidates if c.get("C_mixed", 0.0) > min_c_mixed]
+    qualified.sort(key=lambda x: x.get("C_mixed", 0.0), reverse=True)
+    return qualified[:max_holdings]

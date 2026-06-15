@@ -309,6 +309,29 @@ def portfolio_management_agent(state: AgentState):
     }
 
 
+def allocate_positions(positions, available_capital=500000.0, prev_closes=None):
+    """
+    Calculate volumes for a list of positions using PositionSizer.
+
+    Parameters
+    ----------
+    positions : list[dict]
+        Each dict must have: symbol, symbol_name, C_mixed, prev_close.
+    available_capital : float
+        Total available capital.
+    prev_closes : dict, optional
+        {symbol: close_price} dict.
+
+    Returns
+    -------
+    list[dict]
+        Same list with weight, amount, volume added.
+    """
+    from src.execution.position_sizer import PositionSizer
+    sizer = PositionSizer()
+    return sizer.allocate(positions, available_capital, prev_closes)
+
+
 def format_decision(action: str, quantity: int, confidence: float, agent_signals: list, reasoning: str, market_wide_news_summary: str = "未提供") -> dict:
     """Format the trading decision into a standardized output format.
     Think in English but output analysis in Chinese."""

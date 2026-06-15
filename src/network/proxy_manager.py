@@ -127,3 +127,62 @@ class ProxyManager:
 
 # Shared instance for AkShare flows
 proxy_manager = ProxyManager.from_env()
+
+
+def _patch_akshare_no_proxy() -> None:
+    """
+    Patch akshare's internal request_with_retry to use trust_env=False so that
+    Windows registry / system proxy settings (e.g. Clash on 127.0.0.1:7897) are
+    ignored when calling domestic Chinese API endpoints that don't need a proxy.
+    """
+    try:
+        import requests
+        from requests.adapters import HTTPAdapter
+        import akshare.utils.request as _ak_req
+
+        def _patched_request_with_retry(
+            url,
+            params=None,
+            timeout=15,
+            max_retries=3,
+            base_delay=1.0,
+            random_delay_range=(0.5, 1.5),
+        ):
+            import random as _random
+            import time as _time
+
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    with requests.Session() as session:
+                        session.trust_env = False  # ignore system/env proxy
+                        session.headers.update({
+                            "User-Agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/120.0.0.0 Safari/537.36"
+                            ),
+                            "Referer": "https://quote.eastmoney.com/",
+                        })
+                        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1)
+                        session.mount("http://", adapter)
+                        session.mount("https://", adapter)
+                        response = session.get(url, params=params, timeout=timeout)
+                        response.raise_for_status()
+                        return response
+                except (requests.RequestException, ValueError) as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2**attempt) + _random.uniform(*random_delay_range)
+                        _time.sleep(delay)
+            raise last_exception
+
+        _ak_req.request_with_retry = _patched_request_with_retry
+        # Also patch the already-imported reference in func.py
+        import akshare.utils.func as _ak_func
+        _ak_func.request_with_retry = _patched_request_with_retry
+    except Exception:
+        pass
+
+
+_patch_akshare_no_proxy()

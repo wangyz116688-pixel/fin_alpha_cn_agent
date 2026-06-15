@@ -42,6 +42,8 @@ def _logout() -> None:
         try:
             bs.logout()
             logger.info("BaoStock session closed.")
+        except Exception:
+            pass  # 网络中断时 logout 可能失败，忽略即可
         finally:
             _LOGGED_IN = False
 
@@ -96,7 +98,7 @@ def query_history_k_data_plus(
         frequency="d",
         adjustflag=adjust_flag,
     )
-    if rs.error_code == "10001001":  # not logged in
+    if rs.error_code != "0":  # 登录失效或网络中断，重连后重试一次
         _logout()
         ensure_login()
         rs = bs.query_history_k_data_plus(
@@ -123,7 +125,7 @@ def query_trade_dates(start_date, end_date) -> pd.DataFrame:
     start = _coerce_dates(start_date)
     end = _coerce_dates(end_date)
     rs = bs.query_trade_dates(start_date=start, end_date=end)
-    if rs.error_code == "10001001":  # not logged in
+    if rs.error_code != "0":  # 登录失效或网络中断，重连后重试一次
         _logout()
         ensure_login()
         rs = bs.query_trade_dates(start_date=start, end_date=end)
@@ -141,7 +143,7 @@ def query_trade_dates(start_date, end_date) -> pd.DataFrame:
 def query_stock_basic(code: str) -> pd.DataFrame:
     ensure_login()
     rs = bs.query_stock_basic(code=code)
-    if rs.error_code == "10001001":  # not logged in
+    if rs.error_code != "0":  # 登录失效或网络中断，重连后重试一次
         _logout()
         ensure_login()
         rs = bs.query_stock_basic(code=code)

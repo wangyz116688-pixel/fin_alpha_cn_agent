@@ -7,7 +7,9 @@ from src.utils.logging_config import setup_logger
 from src.utils.api_utils import agent_endpoint, log_llm_interaction
 
 from datetime import datetime, timedelta
+from typing import List, Dict
 import pandas as pd
+import copy
 
 # 设置日志记录
 logger = setup_logger('market_data_agent')
@@ -133,3 +135,47 @@ def market_data_agent(state: AgentState):
         },
         "metadata": state["metadata"],
     }
+
+
+# ---------------------------------------------------------------------------
+# 新增：候选池并行分析（按 DEV_GUIDE 并行化改造）
+# ---------------------------------------------------------------------------
+
+def build_agent_state_for_candidate(
+    candidate: Dict,
+    base_state: Dict = None,
+) -> Dict:
+    """
+    为单个候选标的构建简化的 AgentState，供市场数据收集使用。
+
+    Parameters
+    ----------
+    candidate : dict
+        候选标的 dict（含 symbol, symbol_name 等）。
+    base_state : dict, optional
+        基础 state 模板。
+
+    Returns
+    -------
+    dict
+        可用于 market_data_agent 的 AgentState。
+    """
+    ticker = candidate.get("symbol", "")
+    state = {
+        "messages": [HumanMessage(content=f"分析 {candidate.get('symbol_name', ticker)} ({ticker})")],
+        "data": {
+            "ticker": ticker,
+            "start_date": candidate.get("start_date"),
+            "end_date": candidate.get("end_date"),
+            "portfolio": {"cash": 0, "stock": 0},
+            "candidate_info": candidate,
+        },
+        "metadata": {
+            "show_reasoning": False,
+            "agent_reasoning": {},
+        },
+    }
+    if base_state:
+        state["data"]["start_date"] = base_state.get("data", {}).get("start_date", state["data"]["start_date"])
+        state["data"]["end_date"] = base_state.get("data", {}).get("end_date", state["data"]["end_date"])
+    return state
