@@ -162,7 +162,22 @@ class XGBoostScorer:
             raise RuntimeError("模型未训练或未加载，请先调用 train() 或 load()")
 
         dmatrix = self._make_dmatrix(X, None, None)
-        raw = self.model.predict(dmatrix)
+        best_iteration = getattr(self.model, "best_iteration", None)
+        iteration_range = None
+        if best_iteration is not None:
+            iteration_range = (0, int(best_iteration) + 1)
+
+        try:
+            raw = (
+                self.model.predict(dmatrix, iteration_range=iteration_range)
+                if iteration_range is not None
+                else self.model.predict(dmatrix)
+            )
+        except TypeError:
+            raw = self.model.predict(dmatrix)
+
+        if raw.size == 0:
+            return raw
 
         # 归一化到 [0, 1]
         raw_min = raw.min()

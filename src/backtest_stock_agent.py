@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+FACTOR_CACHE_VERSION = "v2"
 
 
 # ---------------------------------------------------------------------------
@@ -49,13 +51,90 @@ def _stock_cache_path(cache_dir: str, sym: str, start_date: str, end_date: str) 
     return os.path.join(cache_dir, f"{sym}_{start_date}_{end_date}.pkl")
 
 
+def _parse_stock_cache_name(filename: str) -> Optional[Tuple[str, str, str]]:
+    stem, ext = os.path.splitext(filename)
+    if ext.lower() != ".pkl":
+        return None
+    parts = stem.split("_")
+    if len(parts) != 3:
+        return None
+    sym, start, end = parts
+    if not (sym.isdigit() and len(start) == 8 and len(end) == 8):
+        return None
+    return sym, start, end
+
+
+def _cached_symbols_covering(cache_dir: str, start_date: str, end_date: str) -> set[str]:
+    """Return symbols whose cached files cover the requested date span."""
+    if not os.path.isdir(cache_dir):
+        return set()
+
+    spans: Dict[str, List[Tuple[str, str]]] = {}
+    for name in os.listdir(cache_dir):
+        parsed = _parse_stock_cache_name(name)
+        if parsed is None:
+            continue
+        sym, cached_start, cached_end = parsed
+        if cached_end < start_date or cached_start > end_date:
+            continue
+        spans.setdefault(sym, []).append((cached_start, cached_end))
+
+    covered = set()
+    for sym, ranges in spans.items():
+        min_start = min(start for start, _ in ranges)
+        max_end = max(end for _, end in ranges)
+        if min_start <= start_date and max_end >= end_date:
+            covered.add(sym)
+    return covered
+
+
 def _load_cached_stock(cache_dir: str, sym: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
     path = _stock_cache_path(cache_dir, sym, start_date, end_date)
-    if not os.path.exists(path):
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+
+    if not os.path.isdir(cache_dir):
         return None
+
+    frames = []
+    ranges = []
+    for name in os.listdir(cache_dir):
+        parsed = _parse_stock_cache_name(name)
+        if parsed is None:
+            continue
+        cached_sym, cached_start, cached_end = parsed
+        if cached_sym != sym:
+            continue
+        if cached_end < start_date or cached_start > end_date:
+            continue
+        ranges.append((cached_start, cached_end))
+        try:
+            with open(os.path.join(cache_dir, name), "rb") as f:
+                df = pickle.load(f)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                frames.append(df)
+        except Exception:
+            continue
+
+    if not frames:
+        return None
+    if min(start for start, _ in ranges) > start_date or max(end for _, end in ranges) < end_date:
+        return None
+
     try:
-        with open(path, "rb") as f:
-            return pickle.load(f)
+        df = pd.concat(frames, ignore_index=True)
+        df["date"] = pd.to_datetime(df["date"])
+        start_ts = pd.Timestamp(f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}")
+        end_ts = pd.Timestamp(f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:]}")
+        df = df[(df["date"] >= start_ts) & (df["date"] <= end_ts)]
+        df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+        if df.empty:
+            return None
+        return df
     except Exception:
         return None
 
@@ -68,6 +147,52 @@ def _save_cached_stock(cache_dir: str, sym: str, start_date: str, end_date: str,
             pickle.dump(df, f)
     except Exception:
         pass
+
+
+def _stock_info_from_price_cache(cache_dir: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Build a minimal stock universe from cached K-line files for offline runs."""
+    if not os.path.isdir(cache_dir):
+        return pd.DataFrame()
+
+    symbols = set()
+    for name in os.listdir(cache_dir):
+        parsed = _parse_stock_cache_name(name)
+        if parsed is None:
+            continue
+        sym, cached_start, cached_end = parsed
+        if cached_end < start_date or cached_start > end_date:
+            continue
+        symbols.add(sym)
+    symbols = sorted(symbols)
+    if not symbols:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(index=pd.Index(symbols, name="symbol"))
+    df["symbol_name"] = symbols
+    df["industry"] = "未知"
+    df["pe_ttm"] = np.nan
+    df["market_cap_bn"] = np.nan
+    df["is_st"] = False
+    df["chg_60d"] = np.nan
+    logger.info("离线模式: 从 K 线缓存恢复股票池 %d 只", len(df))
+    return df
+
+
+def _factor_cache_path(
+    factor_cache_dir: str,
+    symbols: List[str],
+    as_of_date: pd.Timestamp,
+    lookback_days: int,
+    neutralized: bool,
+) -> str:
+    universe = "|".join(sorted(symbols))
+    universe_hash = hashlib.sha1(universe.encode("utf-8")).hexdigest()[:12]
+    tag = "neutral" if neutralized else "raw"
+    filename = (
+        f"factors_{FACTOR_CACHE_VERSION}_{as_of_date.strftime('%Y%m%d')}"
+        f"_lb{lookback_days}_{tag}_{len(symbols)}_{universe_hash}.pkl"
+    )
+    return os.path.join(factor_cache_dir, filename)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +316,7 @@ def compute_cross_section(
     as_of_date: pd.Timestamp,
     screener: Optional["StockScreener"] = None,
     lookback_days: int = 90,
+    factor_cache_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     基于缓存 K 线，计算截至 as_of_date（含）的完整截面因子矩阵：
@@ -204,10 +330,30 @@ def compute_cross_section(
 
     cutoff = as_of_date
     start_window = cutoff - pd.Timedelta(days=lookback_days + 30)
+    cache_path = None
+    if factor_cache_dir:
+        cache_path = _factor_cache_path(
+            factor_cache_dir,
+            list(price_map.keys()),
+            as_of_date,
+            lookback_days,
+            neutralized=screener is not None,
+        )
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "rb") as f:
+                    factor_df = pickle.load(f)
+                if isinstance(factor_df, pd.DataFrame):
+                    logger.info("因子缓存命中: %s", cache_path)
+                    return factor_df
+            except Exception:
+                logger.warning("因子缓存读取失败，将重新计算: %s", cache_path)
 
     pv_rows = []
     alpha_rows = []
     for sym, df in price_map.items():
+        if df[df["date"] == cutoff].empty:
+            continue
         window = df[(df["date"] >= start_window) & (df["date"] <= cutoff)].copy()
         if window.empty or len(window) < 22:
             continue
@@ -235,6 +381,15 @@ def compute_cross_section(
     if screener is not None:
         empty_info = pd.DataFrame(index=factor_df.index)
         factor_df = screener._neutralize(factor_df, empty_info)
+
+    if cache_path:
+        try:
+            os.makedirs(factor_cache_dir, exist_ok=True)
+            with open(cache_path, "wb") as f:
+                pickle.dump(factor_df, f)
+            logger.info("因子缓存已保存: %s", cache_path)
+        except Exception:
+            logger.warning("因子缓存写入失败: %s", cache_path)
     return factor_df
 
 
@@ -248,17 +403,25 @@ def screen_for_date(
     as_of_date: pd.Timestamp,
     stock_info: pd.DataFrame,
     top_n: int = 20,
+    factor_cache_dir: Optional[str] = None,
+    score_method: str = "ensemble_blend",
 ) -> List[dict]:
-    factor_df = compute_cross_section(price_map, as_of_date, screener)
+    factor_df = compute_cross_section(
+        price_map,
+        as_of_date,
+        screener,
+        factor_cache_dir=factor_cache_dir,
+    )
     if factor_df.empty:
         return []
 
-    valid_syms = set(stock_info.index) & set(factor_df.index)
-    factor_df = factor_df.loc[list(valid_syms)]
+    valid_syms = sorted(set(stock_info.index) & set(factor_df.index))
+    factor_df = factor_df.loc[valid_syms]
     if factor_df.empty:
         return []
 
     factor_df = screener._score(factor_df)
+    factor_df = _apply_score_method(factor_df, score_method)
     candidates = screener._build_candidates(factor_df, stock_info, top_n)
 
     for c in candidates:
@@ -266,6 +429,242 @@ def screen_for_date(
             c["C_mixed"] = c.get("xgb_score", 0.5)
 
     return candidates
+
+
+def _rank_pct(series: pd.Series) -> pd.Series:
+    clean = series.replace([np.inf, -np.inf], np.nan)
+    if clean.notna().sum() == 0:
+        return pd.Series(0.5, index=series.index)
+    return clean.rank(method="average", pct=True).fillna(0.5)
+
+
+def _apply_score_method(factor_df: pd.DataFrame, score_method: str) -> pd.DataFrame:
+    """Optionally replace xgb_score with an IC-informed blended rank score."""
+    method = (score_method or "xgb").lower()
+    if method == "xgb":
+        return factor_df
+    if method == "ic_blend":
+        blend_cols = ["mom_20d", "decay_close_5", "std_close_10"]
+        weights = {col: 1.0 for col in blend_cols}
+    elif method == "recent_ic_blend":
+        weights = {
+            "std_close_10": 0.040301,
+            "decay_close_5": 0.036596,
+            "rev_1d": 0.011555,
+            "ret_close_10": 0.006174,
+        }
+    elif method == "ensemble_blend":
+        ic_cols = ["mom_20d", "decay_close_5", "std_close_10"]
+        available = [c for c in ic_cols if c in factor_df.columns]
+        if not available:
+            logger.warning("ensemble_blend has no IC factors; falling back to xgb_score")
+            return factor_df
+
+        factor_df = factor_df.copy()
+        factor_df["model_score"] = factor_df.get("xgb_score", 0.5)
+        model_rank = _rank_pct(factor_df["model_score"])
+        ic_rank = pd.concat([_rank_pct(factor_df[col]) for col in available], axis=1).mean(axis=1)
+        factor_df["xgb_score"] = (0.5 * model_rank + 0.5 * ic_rank).clip(0.0, 1.0)
+        return factor_df
+    elif method == "train_ic_blend":
+        weights = {
+            "turn_5d_avg": -0.055547,
+            "mom_20d": -0.052257,
+            "vol_20d": -0.049372,
+            "vwap_dev": -0.034496,
+            "zscore_vol_5": -0.030165,
+            "turn_ratio": -0.027209,
+            "rev_1d": 0.014613,
+            "std_vol_10": 0.007617,
+            "std_close_10": 0.005100,
+            "decay_vol_5": 0.004183,
+        }
+    else:
+        raise ValueError(f"Unsupported score_method: {score_method}")
+
+    available = [c for c in weights if c in factor_df.columns]
+    if not available:
+        logger.warning("%s has no available factors; falling back to xgb_score", score_method)
+        return factor_df
+
+    ranks = []
+    rank_weights = []
+    for col in available:
+        weight = weights[col]
+        ranks.append(_rank_pct(factor_df[col] if weight > 0 else -factor_df[col]))
+        rank_weights.append(abs(weight))
+
+    factor_df = factor_df.copy()
+    factor_df["model_score"] = factor_df.get("xgb_score", 0.5)
+    rank_df = pd.concat(ranks, axis=1)
+    factor_df["xgb_score"] = np.average(rank_df.values, axis=1, weights=np.array(rank_weights))
+    factor_df["xgb_score"] = pd.Series(factor_df["xgb_score"], index=factor_df.index).clip(0.0, 1.0)
+    return factor_df
+
+
+def _select_target_positions(
+    candidates: List[dict],
+    position_count: int,
+    confidence_threshold: Optional[float],
+    fill_positions: bool,
+) -> List[dict]:
+    if not candidates or position_count <= 0:
+        return []
+
+    ordered = sorted(candidates, key=lambda x: x.get("C_mixed", 0), reverse=True)
+    if confidence_threshold is None:
+        return ordered[:position_count]
+
+    high_conf = [c for c in ordered if c.get("C_mixed", 0) > confidence_threshold]
+    selected = high_conf[:position_count]
+    if fill_positions and len(selected) < position_count:
+        selected_symbols = {c["symbol"] for c in selected}
+        for c in ordered:
+            if c["symbol"] in selected_symbols:
+                continue
+            selected.append(c)
+            selected_symbols.add(c["symbol"])
+            if len(selected) >= position_count:
+                break
+
+    if selected:
+        return selected
+    return ordered[:position_count]
+
+
+def _candidate_prev_closes(
+    candidates: List[dict],
+    price_map: Dict[str, pd.DataFrame],
+    as_of_date: pd.Timestamp,
+) -> Dict[str, float]:
+    prev_closes: Dict[str, float] = {}
+    for candidate in candidates:
+        sym = candidate["symbol"]
+        if sym not in price_map:
+            continue
+        rows = price_map[sym][price_map[sym]["date"] == as_of_date]
+        if rows.empty:
+            continue
+        prev_close = float(rows.iloc[-1]["close"])
+        if prev_close > 0 and np.isfinite(prev_close):
+            prev_closes[sym] = prev_close
+    return prev_closes
+
+
+def _filter_buyable_candidates(
+    candidates: List[dict],
+    prev_closes: Dict[str, float],
+    available_capital: float,
+    position_count: int,
+    sizer: PositionSizer,
+    allocation_method: str,
+    max_stock_price: Optional[float] = None,
+) -> List[dict]:
+    if not candidates:
+        return []
+
+    if (allocation_method or "score").lower() == "equal":
+        amount_limit = available_capital * (1.0 - sizer.buffer_ratio) / max(position_count, 1)
+    else:
+        amount_limit = available_capital * sizer.max_single_ratio
+    amount_limit = min(amount_limit, available_capital * sizer.max_single_ratio)
+
+    buyable = []
+    for candidate in candidates:
+        sym = candidate["symbol"]
+        prev_close = prev_closes.get(sym)
+        if prev_close is None:
+            continue
+        if max_stock_price is not None and prev_close > max_stock_price:
+            continue
+        if prev_close * sizer.min_volume > amount_limit:
+            continue
+        buyable.append(candidate)
+    return buyable
+
+
+def _build_decisions_for_method(
+    screener: StockScreener,
+    price_map: Dict[str, pd.DataFrame],
+    as_of_date: pd.Timestamp,
+    stock_info: pd.DataFrame,
+    top_n: int,
+    factor_cache_dir: Optional[str],
+    score_method: str,
+    available_capital: float,
+    position_count: int,
+    confidence_threshold: Optional[float],
+    fill_positions: bool,
+    allocation_method: str,
+    sizer: PositionSizer,
+    max_stock_price: Optional[float] = None,
+) -> List[dict]:
+    candidates = screen_for_date(
+        screener,
+        price_map,
+        as_of_date,
+        stock_info,
+        top_n,
+        factor_cache_dir=factor_cache_dir,
+        score_method=score_method,
+    )
+    if not candidates:
+        return []
+
+    prev_closes = _candidate_prev_closes(candidates, price_map, as_of_date)
+    candidates = _filter_buyable_candidates(
+        candidates,
+        prev_closes=prev_closes,
+        available_capital=available_capital,
+        position_count=position_count,
+        sizer=sizer,
+        allocation_method=allocation_method,
+        max_stock_price=max_stock_price,
+    )
+    if not candidates:
+        return []
+
+    selected = _select_target_positions(
+        candidates,
+        position_count=position_count,
+        confidence_threshold=confidence_threshold,
+        fill_positions=fill_positions,
+    )
+    decisions = [dict(item) for item in selected]
+    decisions = sizer.allocate(decisions, available_capital, prev_closes)
+    return [item for item in decisions if item.get("volume", 0) > 0]
+
+
+def _select_adaptive_method(
+    history: Dict[str, List[float]],
+    lookback: int,
+    min_observations: int,
+    cash_threshold: float,
+    default_method: str,
+    switch_margin: float,
+) -> str:
+    scores = {}
+    for method, returns in history.items():
+        recent = returns[-lookback:] if lookback > 0 else returns
+        if len(recent) < min_observations:
+            continue
+        scores[method] = float(np.mean(recent))
+
+    if not scores:
+        return default_method
+
+    best_method, best_score = max(scores.items(), key=lambda item: item[1])
+    default_score = scores.get(default_method)
+
+    if best_score <= cash_threshold:
+        return "cash"
+    if default_score is None:
+        return best_method
+    if default_score <= cash_threshold and best_score > cash_threshold:
+        return best_method
+    if best_method != default_method and best_score >= default_score + switch_margin:
+        return best_method
+    return default_method
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +732,23 @@ def run_backtest(
     log_dir: str = "logs",
     model_path: str = "data/xgb_scorer.model",
     offline: bool = False,
+    factor_cache_dir: Optional[str] = None,
+    no_plot: bool = False,
+    score_method: str = "train_ic_blend",
+    position_count: int = 3,
+    confidence_threshold: Optional[float] = 0.55,
+    fill_positions: bool = True,
+    allocation_method: str = "score",
+    print_advice: bool = True,
+    adaptive_methods: Optional[List[str]] = None,
+    adaptive_lookback: int = 5,
+    adaptive_min_observations: int = 3,
+    adaptive_cash_threshold: float = -0.002,
+    adaptive_default_method: str = "recent_ic_blend",
+    adaptive_switch_margin: float = 0.003,
+    max_drawdown_stop: Optional[float] = 0,
+    risk_cooldown_days: int = 10,
+    max_stock_price: Optional[float] = None,
 ) -> pd.DataFrame:
     logger.info("=" * 60)
     logger.info("竞赛回测  %s ~ %s  资金 %.0f  股票上限 %s",
@@ -340,16 +756,28 @@ def run_backtest(
                 str(max_stocks) if max_stocks else "全市场")
     logger.info("=" * 60)
 
+    fetch_start = (pd.Timestamp(start_date) - pd.Timedelta(days=120)).strftime("%Y%m%d")
+
     # ---- Step 1: 股票列表 ----
     screener = StockScreener(end_date=end_date, request_interval=request_interval)
     screener.load_model(model_path)   # 不存在时自动降级为等权打分
-    stock_info = screener.get_stock_list()
+    stock_info = screener.get_stock_list(offline=offline)
+    if stock_info.empty and offline:
+        stock_info = _stock_info_from_price_cache(cache_dir, fetch_start, end_date)
     if stock_info.empty:
         logger.error("获取股票列表失败")
         return pd.DataFrame()
 
     tradable_info = screener.filter_tradable(stock_info)
-    symbols = tradable_info.index.tolist()
+    symbols = sorted(tradable_info.index.tolist())
+    if offline:
+        cached_symbols = _cached_symbols_covering(cache_dir, fetch_start, end_date)
+        if cached_symbols:
+            symbols = sorted(set(symbols) & cached_symbols)
+            tradable_info = tradable_info.loc[tradable_info.index.isin(symbols)]
+            logger.info("Offline cache-covered universe: %d symbols", len(symbols))
+        else:
+            logger.warning("Offline mode found no cache-covered symbols for %s ~ %s", fetch_start, end_date)
 
     if max_stocks and max_stocks < len(symbols):
         # 随机采样以覆盖不同行业
@@ -362,7 +790,6 @@ def run_backtest(
         logger.info("可交易标的: %d 只", len(symbols))
 
     # ---- Step 2: 预拉取（断点续传）----
-    fetch_start = (pd.Timestamp(start_date) - pd.Timedelta(days=120)).strftime("%Y%m%d")
     logger.info("[Step 2] 预拉取 K 线（缓存目录: %s）", cache_dir)
     price_map = prefetch_price_data(
         symbols, fetch_start, end_date,
@@ -395,11 +822,18 @@ def run_backtest(
     # ---- Step 4: 逐日回测 ----
     from src.execution.output_formatter import OutputFormatter
 
-    sizer = PositionSizer()
+    sizer = PositionSizer(allocation_method=allocation_method)
     formatter = OutputFormatter(log_dir=log_dir)
     capital = initial_capital
     daily_records = []
     daily_advice: Dict[str, List[dict]] = {}   # {YYYYMMDD: [{symbol, symbol_name, volume}, ...]}
+    adaptive_mode = (score_method or "").lower() == "adaptive_blend"
+    if adaptive_methods is None:
+        adaptive_methods = ["recent_ic_blend", "train_ic_blend", "ic_blend", "xgb"]
+    adaptive_methods = [m.strip() for m in adaptive_methods if m and m.strip()]
+    adaptive_history: Dict[str, List[float]] = {m: [] for m in adaptive_methods}
+    risk_peak = capital
+    risk_cooldown_remaining = 0
 
     logger.info("[Step 4] 开始逐日回测...")
     logger.info("-" * 70)
@@ -412,43 +846,94 @@ def run_backtest(
 
         date_str = trade_date.strftime("%Y%m%d")
 
-        candidates = screen_for_date(screener, price_map, as_of_date, tradable_info, top_n)
-        if not candidates:
-            logger.info("%s  空仓（无候选）", trade_date.date())
-            daily_records.append({"date": trade_date, "total_assets": capital,
-                                   "pnl": 0.0, "positions": 0, "return_pct": 0.0})
-            daily_advice[date_str] = []
-            continue
+        if risk_cooldown_remaining > 0:
+            selected_method = "risk_off"
+            decisions = []
+            next_capital = capital
+            records = []
+            detail_df = pd.DataFrame()
+            risk_cooldown_remaining -= 1
+        elif adaptive_mode:
+            selected_method = _select_adaptive_method(
+                adaptive_history,
+                lookback=adaptive_lookback,
+                min_observations=adaptive_min_observations,
+                cash_threshold=adaptive_cash_threshold,
+                default_method=adaptive_default_method,
+                switch_margin=adaptive_switch_margin,
+            )
+            method_results = {}
+            for method in adaptive_methods:
+                method_decisions = _build_decisions_for_method(
+                    screener=screener,
+                    price_map=price_map,
+                    as_of_date=as_of_date,
+                    stock_info=tradable_info,
+                    top_n=top_n,
+                    factor_cache_dir=factor_cache_dir,
+                    score_method=method,
+                    available_capital=capital,
+                    position_count=position_count,
+                    confidence_threshold=confidence_threshold,
+                    fill_positions=fill_positions,
+                    allocation_method=allocation_method,
+                    sizer=sizer,
+                    max_stock_price=max_stock_price,
+                )
+                method_capital, method_records, method_detail = settle_day(
+                    method_decisions,
+                    price_map,
+                    trade_date,
+                    capital,
+                )
+                method_return = (method_capital - capital) / capital if capital > 0 else 0.0
+                adaptive_history[method].append(method_return)
+                method_results[method] = (method_capital, method_records, method_detail, method_decisions)
 
-        candidates = sorted(candidates, key=lambda x: x.get("C_mixed", 0), reverse=True)
-        high_conf = [c for c in candidates if c.get("C_mixed", 0) > 0.55]
-        top5 = high_conf[:5] if high_conf else candidates[:5]
-
-        prev_closes: Dict[str, float] = {}
-        for c in top5:
-            sym = c["symbol"]
-            if sym in price_map:
-                rows = price_map[sym][price_map[sym]["date"] == as_of_date]
-                if not rows.empty:
-                    prev_closes[sym] = float(rows.iloc[-1]["close"])
-
-        decisions = sizer.allocate(top5, capital, prev_closes)
+            if selected_method == "cash":
+                decisions = []
+                next_capital = capital
+                records = []
+                detail_df = pd.DataFrame()
+            else:
+                next_capital, records, detail_df, decisions = method_results.get(
+                    selected_method,
+                    (capital, [], pd.DataFrame(), []),
+                )
+        else:
+            selected_method = score_method
+            decisions = _build_decisions_for_method(
+                screener=screener,
+                price_map=price_map,
+                as_of_date=as_of_date,
+                stock_info=tradable_info,
+                top_n=top_n,
+                factor_cache_dir=factor_cache_dir,
+                score_method=score_method,
+                available_capital=capital,
+                position_count=position_count,
+                confidence_threshold=confidence_threshold,
+                fill_positions=fill_positions,
+                allocation_method=allocation_method,
+                sizer=sizer,
+                max_stock_price=max_stock_price,
+            )
+            next_capital, records, detail_df = settle_day(decisions, price_map, trade_date, capital)
 
         # 记录当日操作建议（赛制 JSON 格式：symbol / symbol_name / volume）
         advice = formatter.format(decisions)
         daily_advice[date_str] = advice
 
         # 终端实时输出当日操作建议 JSON（便于在 VSCode 终端直观查看 / 录屏）
-        print(f"\n===== {date_str} 操作建议（共 {len(advice)} 只）=====", flush=True)
-        print(json.dumps(advice, ensure_ascii=False, indent=2), flush=True)
-
-        next_capital, records, detail_df = settle_day(decisions, price_map, trade_date, capital)
+        if print_advice:
+            print(f"\n===== {date_str} 操作建议（共 {len(advice)} 只）=====", flush=True)
+            print(json.dumps(advice, ensure_ascii=False, indent=2), flush=True)
 
         day_pnl = next_capital - capital
         ret_pct = day_pnl / capital * 100 if capital > 0 else 0.0
 
-        logger.info("%s  持仓 %d 只 | 日盈亏 %+.2f | 日收益 %+.2f%% | 总资产 %.2f",
-                    trade_date.strftime("%Y-%m-%d"), len(records), day_pnl, ret_pct, next_capital)
+        logger.info("%s  方法 %s | 持仓 %d 只 | 日盈亏 %+.2f | 日收益 %+.2f%% | 总资产 %.2f",
+                    trade_date.strftime("%Y-%m-%d"), selected_method, len(records), day_pnl, ret_pct, next_capital)
         if not detail_df.empty:
             for _, row in detail_df.iterrows():
                 logger.info("    %-8s %-10s 昨收%.2f 今收%.2f 金额%.0f 盈亏%+.2f(%+.2f%%)",
@@ -457,8 +942,21 @@ def run_backtest(
                             row["amount"], row["pnl"], row["pnl_pct"])
 
         daily_records.append({"date": trade_date, "total_assets": next_capital,
-                               "pnl": day_pnl, "positions": len(records), "return_pct": ret_pct})
+                               "pnl": day_pnl, "positions": len(records),
+                               "return_pct": ret_pct, "method": selected_method})
         capital = next_capital
+        risk_peak = max(risk_peak, capital)
+        if max_drawdown_stop and max_drawdown_stop > 0 and risk_peak > 0:
+            current_drawdown = (risk_peak - capital) / risk_peak
+            if current_drawdown >= max_drawdown_stop and risk_cooldown_remaining <= 0:
+                risk_cooldown_remaining = risk_cooldown_days if risk_cooldown_days > 0 else len(trade_dates)
+                risk_peak = capital
+                logger.warning(
+                    "Risk stop triggered: drawdown %.2f%% >= %.2f%%; cash for %d trading days",
+                    current_drawdown * 100,
+                    max_drawdown_stop * 100,
+                    risk_cooldown_remaining,
+                )
 
     # ---- Step 5: 汇总 ----
     result_df = pd.DataFrame(daily_records).set_index("date")
@@ -496,7 +994,10 @@ def run_backtest(
     logger.info("每日操作建议已保存: %s/（共 %d 天）", advice_dir, len(daily_advice))
     logger.info("操作建议汇总: %s", all_path)
 
-    _plot_results(result_df, initial_capital, log_dir, tag)
+    if no_plot:
+        logger.info("已跳过图表生成 (--no-plot)")
+    else:
+        _plot_results(result_df, initial_capital, log_dir, tag)
     return result_df
 
 
@@ -655,11 +1156,52 @@ def _parse_args():
     parser.add_argument("--log-dir", type=str, default="logs", help="日志输出目录")
     parser.add_argument("--model-path", type=str, default="data/xgb_scorer.model",
                         help="XGBoost 模型路径（不存在时自动降级为等权打分）")
+    parser.add_argument("--factor-cache-dir", type=str, default=None,
+                        help="每日截面因子缓存目录；重复回测同一股票池/日期时可显著提速")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="跳过回测图表生成，加快长周期批量回测")
+    parser.add_argument(
+        "--score-method",
+        choices=["xgb", "ic_blend", "recent_ic_blend", "train_ic_blend", "ensemble_blend", "adaptive_blend"],
+        default="train_ic_blend",
+        help="Ranking method",
+    )
+    parser.add_argument("--position-count", type=int, default=3,
+                        help="Target number of daily positions")
+    parser.add_argument("--confidence-threshold", type=float, default=0.55,
+                        help="Confidence threshold; set negative to disable")
+    parser.add_argument("--no-fill-positions", action="store_true",
+                        help="Do not fill below-threshold candidates up to position-count")
+    parser.add_argument("--allocation-method", choices=["equal", "score"], default="score",
+                        help="Capital allocation method")
+    parser.add_argument("--quiet-advice", action="store_true",
+                        help="Do not print daily advice JSON to stdout")
+    parser.add_argument("--adaptive-methods", type=str,
+                        default="recent_ic_blend,train_ic_blend,ic_blend,xgb",
+                        help="Comma-separated methods used by adaptive_blend")
+    parser.add_argument("--adaptive-lookback", type=int, default=5,
+                        help="Trailing days used by adaptive_blend")
+    parser.add_argument("--adaptive-min-observations", type=int, default=3,
+                        help="Minimum method observations before adaptive_blend switches")
+    parser.add_argument("--adaptive-cash-threshold", type=float, default=-0.002,
+                        help="Use cash if best trailing average return is below this value")
+    parser.add_argument("--adaptive-default-method", type=str, default="recent_ic_blend",
+                        help="Method used before adaptive_blend has enough history")
+    parser.add_argument("--adaptive-switch-margin", type=float, default=0.003,
+                        help="Required trailing-return advantage before switching from default method")
+    parser.add_argument("--max-drawdown-stop", type=float, default=0,
+                        help="Portfolio drawdown threshold that triggers risk-off; set 0 to disable")
+    parser.add_argument("--risk-cooldown-days", type=int, default=10,
+                        help="Trading days to stay in cash after the drawdown stop is triggered")
+    parser.add_argument("--max-stock-price", type=float, default=0,
+                        help="Skip candidates above this previous close price; set 0 to disable")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    confidence_threshold = None if args.confidence_threshold < 0 else args.confidence_threshold
+    max_stock_price = None if args.max_stock_price <= 0 else args.max_stock_price
 
     if args.mvp:
         # MVP：最近 3 个交易日，500 只股票
@@ -677,6 +1219,23 @@ if __name__ == "__main__":
             log_dir=args.log_dir,
             model_path=args.model_path,
             offline=args.offline,
+            factor_cache_dir=args.factor_cache_dir,
+            no_plot=args.no_plot,
+            score_method=args.score_method,
+            position_count=args.position_count,
+            confidence_threshold=confidence_threshold,
+            fill_positions=not args.no_fill_positions,
+            allocation_method=args.allocation_method,
+            print_advice=not args.quiet_advice,
+            adaptive_methods=args.adaptive_methods.split(","),
+            adaptive_lookback=args.adaptive_lookback,
+            adaptive_min_observations=args.adaptive_min_observations,
+            adaptive_cash_threshold=args.adaptive_cash_threshold,
+            adaptive_default_method=args.adaptive_default_method,
+            adaptive_switch_margin=args.adaptive_switch_margin,
+            max_drawdown_stop=args.max_drawdown_stop,
+            risk_cooldown_days=args.risk_cooldown_days,
+            max_stock_price=max_stock_price,
         )
     else:
         run_backtest(
@@ -690,4 +1249,21 @@ if __name__ == "__main__":
             log_dir=args.log_dir,
             model_path=args.model_path,
             offline=args.offline,
+            factor_cache_dir=args.factor_cache_dir,
+            no_plot=args.no_plot,
+            score_method=args.score_method,
+            position_count=args.position_count,
+            confidence_threshold=confidence_threshold,
+            fill_positions=not args.no_fill_positions,
+            allocation_method=args.allocation_method,
+            print_advice=not args.quiet_advice,
+            adaptive_methods=args.adaptive_methods.split(","),
+            adaptive_lookback=args.adaptive_lookback,
+            adaptive_min_observations=args.adaptive_min_observations,
+            adaptive_cash_threshold=args.adaptive_cash_threshold,
+            adaptive_default_method=args.adaptive_default_method,
+            adaptive_switch_margin=args.adaptive_switch_margin,
+            max_drawdown_stop=args.max_drawdown_stop,
+            risk_cooldown_days=args.risk_cooldown_days,
+            max_stock_price=max_stock_price,
         )

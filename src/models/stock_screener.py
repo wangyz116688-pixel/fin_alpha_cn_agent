@@ -13,6 +13,8 @@
 """
 
 import logging
+import os
+import pickle
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -124,7 +126,54 @@ class StockScreener:
     # Step 1: 获取全市场股票列表
     # ------------------------------------------------------------------
 
-    def get_stock_list(self) -> pd.DataFrame:
+    def _stock_list_cache_path(self, cache_dir: str, date: Optional[str] = None) -> str:
+        date = date or self.end_date
+        return os.path.join(cache_dir, f"stock_list_{date}.pkl")
+
+    def _load_cached_stock_list(self, cache_dir: str, allow_latest: bool = False) -> pd.DataFrame:
+        paths = [self._stock_list_cache_path(cache_dir)]
+        if allow_latest and os.path.isdir(cache_dir):
+            cached_paths = sorted(
+                [
+                    os.path.join(cache_dir, name)
+                    for name in os.listdir(cache_dir)
+                    if name.startswith("stock_list_") and name.endswith(".pkl")
+                ],
+                key=os.path.getmtime,
+                reverse=True,
+            )
+            paths.extend(path for path in cached_paths if path not in paths)
+
+        for path in paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "rb") as f:
+                    df = pickle.load(f)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    logger.info("加载股票列表缓存: %s", path)
+                    return df
+            except Exception:
+                logger.warning("股票列表缓存读取失败: %s", path)
+        return pd.DataFrame()
+
+    def _save_stock_list_cache(self, df: pd.DataFrame, cache_dir: str) -> None:
+        if df.empty:
+            return
+        os.makedirs(cache_dir, exist_ok=True)
+        path = self._stock_list_cache_path(cache_dir)
+        try:
+            with open(path, "wb") as f:
+                pickle.dump(df, f)
+            logger.info("股票列表已缓存: %s", path)
+        except Exception:
+            logger.warning("股票列表缓存写入失败: %s", path)
+
+    def get_stock_list(
+        self,
+        offline: bool = False,
+        cache_dir: str = "data/stock_list_cache",
+    ) -> pd.DataFrame:
         """
         拉取沪深 A 股基础信息，返回 DataFrame，行索引为 symbol。
 
@@ -135,14 +184,19 @@ class StockScreener:
         pd.DataFrame
             列: symbol_name, industry, market_cap_bn, pe_ttm, is_st, is_suspend, listed_days
         """
+        if offline:
+            return self._load_cached_stock_list(cache_dir, allow_latest=True)
+
         df = self._get_stock_list_baostock()
         if df is not None and not df.empty:
+            self._save_stock_list_cache(df, cache_dir)
             return df
         logger.warning("baostock 拉取失败，回退到 AKShare")
         df = self._get_stock_list_akshare()
         if df is not None and not df.empty:
+            self._save_stock_list_cache(df, cache_dir)
             return df
-        return pd.DataFrame()
+        return self._load_cached_stock_list(cache_dir, allow_latest=True)
 
     def _get_stock_list_akshare(self) -> Optional[pd.DataFrame]:
         """通过 AKShare stock_zh_a_spot_em 拉取（带重试）。"""

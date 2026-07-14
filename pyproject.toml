@@ -1,7 +1,7 @@
 [project]
-name = "ashare-investment-agent"
+name = "alphaagent-ashare"
 version = "0.1.0"
-description = "An AI-powered hedge fund that uses multiple agents to make trading decisions"
+description = "AlphaAgent: an explainable A-share quantitative stock-selection agent"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -15,6 +15,8 @@ dependencies = [
     "yfinance>=0.2.51,<0.3.0",
     "akshare>=1.11.22,<2.0.0",
     "baostock>=0.8.9,<0.9.0",
+    "scikit-learn>=1.3.0,<2.0.0",
+    "xgboost>=2.0.0,<3.0.0",
     "requests>=2.31.0,<3.0.0",
     "beautifulsoup4>=4.12.3,<5.0.0",
     "openai>=1.12.0,<2.0.0",
@@ -36,10 +38,10 @@ dev = [
 ]
 
 [tool.poetry]
-name = "ashare-investment-agent"
+name = "alphaagent-ashare"
 version = "0.1.0"
-description = "An AI-powered hedge fund that uses multiple agents to make trading decisions"
-authors = ["Your Name <your.email@example.com>"]
+description = "AlphaAgent: an explainable A-share quantitative stock-selection agent"
+authors = ["AlphaAgent Team"]
 readme = "README.md"
 packages = [
     { include = "src" }
@@ -56,6 +58,8 @@ matplotlib = "^3.9.2"
 yfinance = "^0.2.51"
 akshare = "^1.11.22"
 baostock = "^0.8.9"
+scikit-learn = "^1.3.0"
+xgboost = "^2.0.0"
 requests = "^2.31.0"
 beautifulsoup4 = "^4.12.3"
 openai = "^1.12.0"

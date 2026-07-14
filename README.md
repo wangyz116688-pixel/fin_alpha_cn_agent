@@ -1,228 +1,294 @@
-# AlphaAgent · A 股量化选股投资智能体
+# AlphaAgent · 面向 A 股的量化选股智能体
 
-> 基于量价因子与多智能体协同的 A 股日内投资系统
-> 初始资金 50 万元 · 每日输出标准 JSON 操作建议 · 日终清仓结算
+AlphaAgent 是一个面向 A 股市场的量化选股 Agent 项目。系统以日频行情数据为基础，完成股票池构建、因子计算、因子有效性检验、选股排序、资金分配、回测验证和操作建议输出，适用于量化投资研究、竞赛展示和 Agent 产品设计说明。
 
-**⚠️ 免责声明：本项目仅用于教育、研究与竞赛目的，不构成任何投资或实际交易建议。投资有风险，决策需谨慎。**
+> 免责声明：本项目仅用于教育、研究和竞赛展示，不构成任何投资建议。投资有风险，实盘交易需自行承担风险。
 
----
+## 当前最新结论
 
-## 一、项目概述
+经过多轮因子有效性验证和 2024、2025、2026 多窗口回测，项目最终默认策略为：
 
-AlphaAgent 是一个面向 A 股市场的**量化选股 + 智能体决策**双层投资系统。每个交易日从沪深两市全市场（约 5000 只）股票中自动扫描、过滤、打分，筛选出候选标的，按置信度加权分配资金，最终输出符合赛制要求的 JSON 操作建议。
-
-系统采用双层架构：
-
-- **量化层（已实现）**：量价因子 + AlphaNet 时序特征 → 五因子中性化 → XGBoost 打分 → Top-N 候选池。客观、可回测、可复现。
-- **智能体层（设计中 / 占位）**：对候选标的调用多个专业 Agent（技术面、基本面、情绪、估值、宏观）协同分析，经多空辩论输出混合置信度 `C_mixed`。当前为占位实现，`C_mixed` 直接取量化得分。
-
-> 因子构建与选股策略的详细可解释性说明见 [因子与选股策略说明.md](因子与选股策略说明.md)。
-> 完整系统设计文档见 [PROJECT_SPEC.md](PROJECT_SPEC.md)。
-
----
-
-## 二、系统流水线
-
-```
-每日触发
-   ↓
-Layer 0  数据采集   baostock（主） / AKShare（备）拉取全市场前复权 K 线
-   ↓
-Layer 1  因子计算   量价因子(13) + AlphaNet 时序特征(10)
-   ↓
-Layer 2  量化选股   五因子 OLS 中性化 → XGBoost 打分 → Top-N 候选池
-   ↓
-Layer 3  智能体决策 多 Agent 分析 → 混合置信度 C_mixed（当前为占位实现）
-   ↓
-Layer 4  输出执行   按 C_mixed 加权分配资金 → volume 取 100 整数倍 → JSON + 审计日志
+```text
+score_method = train_ic_blend
+allocation_method = score
+position_count = 3
+max_drawdown_stop = 0
 ```
 
----
+含义：
 
-## 三、数据源说明
+- `train_ic_blend`：使用训练期 IC 验证过的因子方向进行排序。
+- `score`：按股票得分进行资金加权分配。
+- `position_count = 3`：每日最多持有 3 只股票。
+- `max_drawdown_stop = 0`：默认不启用硬停手机制；风控参数保留为可选实验项。
 
-| 数据源 | 用途 | 状态 |
-|--------|------|------|
-| **baostock** | 全市场股票列表、日频前复权 K 线 | **主数据源** |
-| AKShare | 实时行情、财务、新闻；K 线备用 | 备用 / 降级 |
+最终验证显示，旧的 `adaptive_blend` 默认策略在扩展 2026 样本中表现不稳定，已不再作为默认策略。当前 README 只保留最新可交付版本的说明。
 
-> **为什么以 baostock 为主**：AKShare 底层依赖东方财富 HTTPS 接口，在部分网络环境（如本地开启系统代理）下易出现 `ProxyError` / `RemoteDisconnected`。baostock 使用独立协议，更稳定。代码会优先走 baostock，失败时自动回退到 AKShare（见 [stock_screener.py](src/models/stock_screener.py) 与 [price_volume.py](src/factors/price_volume.py)）。
+## 最新回测表现
 
----
+回测口径：初始资金 500,000 元，日频选股，前一交易日收盘后生成信号，当日收盘价结算，日终清仓，使用本地缓存离线复现。
 
-## 四、安装与环境
+| 窗口 | 股票数 | 交易日 | 累计收益率 | 年化收益率 | 最大回撤 | 夏普比率 | 索泰诺比率 | 卡玛比率 | 胜率 | 盈亏比 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2024 全年 | 500 | 241 | 17.77% | 18.65% | 21.93% | 0.83 | 1.35 | 0.85 | 51.04% | 1.12 |
+| 2025 全年 | 500 | 242 | 19.75% | 20.64% | 7.11% | 1.44 | 1.91 | 2.90 | 50.41% | 1.28 |
+| 2026 最新样本 | 500 | 40 | 1.74% | 11.47% | 5.13% | 0.61 | 1.37 | 2.23 | 50.00% | 1.10 |
 
-### 1. 创建虚拟环境并安装依赖
+指标文件：
 
-项目使用 `pyproject.toml` 管理依赖，推荐 `uv`：
+- `logs/factor_analysis/final_performance_metrics.csv`
+- `logs/factor_analysis/final_default_comparison.csv`
+- `logs/factor_analysis/validation_report.md`
 
-```bash
-uv sync
-```
+### 产品优势
 
-或使用已有的 `venv`（Windows）：
+- 2025 全年卡玛比率为 2.90，说明收益与回撤之间的平衡较好。
+- 2026 最新样本最大回撤为 5.13%，卡玛比率为 2.23，说明近期样本中仍保持较好的风险收益比。
+- 胜率约 50%，但盈亏比大于 1，说明策略优势不是依赖高胜率，而是依靠盈利日略大于亏损日的结构获得正收益。
+- 2024、2025、2026 三个窗口均为正收益，证明当前默认策略具备跨窗口稳定性。
 
-```powershell
-# 依赖已安装在 venv 中；如需重装，先导出再安装：
-uv export --format requirements-txt > requirements.txt
-.\venv\Scripts\python.exe -m pip install -r requirements.txt
-```
+需要注意：2024 全年最大回撤为 21.93%，说明策略在市场风格剧烈切换时仍有明显回撤风险。作品展示时建议诚实说明这一点，并作为后续风控优化方向。
 
-核心依赖：`pandas`、`numpy`、`baostock`、`akshare`、`xgboost`、`scikit-learn`、`matplotlib`。
+## 项目结构
 
-### 2. 配置环境变量（智能体层可选）
-
-复制 `.env.example` 为 `.env`，量化选股层无需任何 API Key 即可运行。仅当启用智能体层时需配置 LLM：
-
-```env
-# LLM（智能体层，可选）
-OPENAI_COMPATIBLE_API_KEY=your_key
-OPENAI_COMPATIBLE_BASE_URL=https://api.deepseek.com/v1
-OPENAI_COMPATIBLE_MODEL=deepseek-chat
-
-# 代理轮询（AKShare 用，默认 direct 即不走代理）
-AKSHARE_PROXY_LIST=direct
-```
-
----
-
-## 五、使用指南
-
-> Windows 下请用 `.\venv\Scripts\python.exe` 替换下方的 `python`。
-
-### 1. 每日选股（生成当日操作建议）
-
-```bash
-python -m src.main_stock_agent --date 20260613 --top-n 20 --capital 500000 --skip-llm
-```
-
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `--date` | 交易日期 YYYYMMDD | 今天 |
-| `--top-n` | 候选池大小 | 20 |
-| `--capital` | 可用资金 | 500000 |
-| `--skip-llm` | 跳过智能体层（仅量化选股） | false |
-
-### 2. 竞赛口径回测
-
-按赛制结算（前一交易日收盘价买入、当日收盘价卖出、日终清仓、次日资金=累计总资产）。
-
-```bash
-# MVP 快速验证：随机 500 只 × 最近 3 个交易日
-python -m src.backtest_stock_agent --mvp
-
-# 完整回测
-python -m src.backtest_stock_agent --start 20260518 --end 20260613 --capital 500000 --top-n 20
-```
-
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `--mvp` | 快速模式（500 只 × 3 日） | - |
-| `--start` / `--end` | 回测区间 YYYYMMDD | 20260518 / 今天 |
-| `--capital` | 初始资金 | 500000 |
-| `--top-n` | 每日候选池大小 | 20 |
-| `--max-stocks` | 限制股票池大小（加速测试） | 全市场 |
-| `--cache-dir` | K 线缓存目录（断点续传） | data/prefetch_cache |
-| `--model-path` | XGBoost 模型路径（不存在时等权降级） | data/xgb_scorer.model |
-| `--offline` | 离线模式：只用本地缓存股票、完全不联网 | false |
-
-**断点续传**：每只股票拉完即写盘缓存，中断后重新运行同一命令自动跳过已缓存股票；网络失败自动重试（指数退避）。
-
-### 3. 训练 XGBoost 模型
-
-用历史数据训练排序打分模型（特征与选股/回测端完全一致：量价 + AlphaNet + 中性化；严格防未来函数）。
-
-```bash
-# 先小样本验证流程（约 10-15 分钟）
-python -m src.models.train_xgboost --start 20240101 --end 20241231 --max-stocks 300
-
-# 完整训练，保存到 data/xgb_scorer.model
-python -m src.models.train_xgboost --start 20220101 --end 20251231 --output data/xgb_scorer.model
-```
-
-训练完成后，`main_stock_agent` 与 `backtest_stock_agent` 会自动加载 `data/xgb_scorer.model`（可用 `--model-path` 指定）；模型不存在时自动降级为等权打分。
-
-### 4. 回测输出
-
-回测结束后在 `logs/` 下生成：
-
-| 文件 | 内容 |
-|------|------|
-| `backtest_<tag>.csv` | 每日资产 / 盈亏 / 收益率明细 |
-| `backtest_<tag>.png` | 总资产走势 + 日收益 / 累计收益曲线 |
-| `advice_<tag>/YYYYMMDD.json` | **每个交易日**的操作建议 |
-| `advice_<tag>.json` | 所有交易日操作建议汇总 |
-
-**操作建议 JSON 格式（赛制标准）**：
-
-```json
-[
-  {"symbol": "600519", "symbol_name": "贵州茅台", "volume": 100},
-  {"symbol": "000858", "symbol_name": "五粮液",   "volume": 200}
-]
-```
-
----
-
-## 六、项目结构
-
-```
+```text
 invest_aiagent/
 ├── src/
-│   ├── factors/                      # 量化因子体系
-│   │   ├── price_volume.py           # 量价因子（动量/波动/换手/量价相关）+ K 线拉取
-│   │   ├── alphanet_features.py      # 6 类时序算子 → 10 个 AlphaNet 特征
-│   │   ├── factor_neutralize.py      # 五因子 OLS 截面中性化
-│   │   └── capital_flow.py           # 资金流因子（已定义，尚未接入选股流程）
-│   ├── models/                       # 量化模型
-│   │   ├── stock_screener.py         # 全市场扫描 → 过滤 → 因子 → 中性化 → 打分 → 候选池
-│   │   ├── xgboost_scorer.py         # XGBoost 排序打分（训练/推理/微调）
-│   │   └── train_xgboost.py          # 模型训练脚本（构建训练集 + 时序切分 + 训练）
-│   ├── execution/                    # 输出执行层
-│   │   ├── position_sizer.py         # 按 C_mixed 加权分配资金，volume 取整
-│   │   └── output_formatter.py       # 标准 JSON 输出 + reasoning.md 审计日志
-│   ├── tools/                        # 数据接入与工具
-│   │   ├── baostock_client.py        # baostock 封装（登录复用/重试）
-│   │   ├── akshare_cache.py          # AKShare + SQLite 缓存层
-│   │   └── ...
-│   ├── network/
-│   │   └── proxy_manager.py          # 代理轮询 + AKShare no-proxy 补丁
-│   ├── agents/                       # 多智能体模块（Layer 3，设计中/占位）
-│   ├── main_stock_agent.py           # ★ 竞赛主入口（每日选股）
-│   ├── backtest_stock_agent.py       # ★ 竞赛口径回测
-│   ├── main.py                       # 原项目入口（单股票 LLM 分析，保留）
-│   └── backtester.py                 # 原项目回测（单股票，保留）
-├── PROJECT_SPEC.md                   # 系统完整设计文档
-├── 因子与选股策略说明.md              # 因子构建与选股策略可解释性说明
+│   ├── backtest_stock_agent.py      # 竞赛口径回测主入口，当前默认策略在这里
+│   ├── main_stock_agent.py          # 每日选股入口
+│   ├── agents/                      # 多智能体分析模块
+│   ├── execution/                   # 仓位分配和输出格式化
+│   ├── factors/                     # 量价因子、AlphaNet 特征、中性化
+│   ├── models/                      # 股票筛选器、XGBoost 训练与推理
+│   ├── tools/                       # baostock、AKShare、市场数据工具
+│   └── utils/                       # 配置、日志、序列化等工具
+├── scripts/
+│   ├── analyze_factor_ic.py         # 因子 IC 分析脚本
+│   ├── agent_status_check.py        # Agent 状态检查
+│   └── run_pipeline_check.py        # 流程检查脚本
+├── data/
+│   ├── train_cache/                 # 2023-08 至 2025-12 历史 K 线缓存
+│   ├── prefetch_cache/              # 近期行情缓存
+│   ├── factor_cache/                # 近期因子缓存
+│   └── factor_cache_train/          # 训练期因子缓存
+├── logs/
+│   ├── factor_analysis/             # 最终指标、因子 IC、验证报告
+│   ├── full_2024_default_final_s500/
+│   ├── full_2025_default_final_s500/
+│   └── long_2026_default_final_s500/
+├── 作品设计书_撰写稿.md              # 最新作品设计书草稿
 ├── pyproject.toml
 └── README.md
 ```
 
-> `src/main.py` 与 `src/backtester.py` 来自原始开源项目（单股票多智能体 LLM 对冲基金），本项目保留它们作为智能体层的参考实现，竞赛主流程不依赖它们。
+## 环境安装
 
----
+推荐使用项目已有的 `venv`，或通过 `uv` / `poetry` 安装依赖。
 
-## 七、当前实现状态
+### 使用已有虚拟环境
 
-| 模块 | 状态 | 说明 |
-|------|------|------|
-| 全市场扫描 + ST/市值/PE 过滤 | ✅ 已实现 | baostock 主，约 5000 → 4970 只可交易 |
-| 量价因子（13 个） | ✅ 已实现 | [price_volume.py](src/factors/price_volume.py) |
-| AlphaNet 时序特征（10 个） | ✅ 已实现 | [alphanet_features.py](src/factors/alphanet_features.py) |
-| 五因子 OLS 中性化 | ✅ 已实现 | [factor_neutralize.py](src/factors/factor_neutralize.py) |
-| XGBoost 打分 + 训练脚本 | ✅ 已实现 | [train_xgboost.py](src/models/train_xgboost.py)；未训练模型时自动等权 `0.5` 降级 |
-| 模型自动加载 | ✅ 已实现 | 主流程与回测自动加载 `data/xgb_scorer.model`（`--model-path` 可指定） |
-| 资金分配 + JSON 输出 | ✅ 已实现 | [position_sizer.py](src/execution/position_sizer.py) |
-| 竞赛口径回测 + 每日建议 | ✅ 已实现 | [backtest_stock_agent.py](src/backtest_stock_agent.py) |
-| 资金流因子 | ⚠️ 已定义，未接入 | [capital_flow.py](src/factors/capital_flow.py) |
-| 多智能体决策层 | ⚠️ 占位实现 | `C_mixed = xgb_score` |
+Windows PowerShell：
 
-> **重要**：XGBoost 尚未训练模型时，全市场股票得分均为 `0.5`（等权），选股相当于在中性化因子排序上的基线。要体现量化 alpha，需先训练模型并通过 `StockScreener.set_model()` 加载。
+```powershell
+.\venv\Scripts\python.exe -m pip install -e .
+```
 
----
+### 使用 uv
 
-## 八、致谢与许可
+```powershell
+uv sync
+```
 
-本项目的智能体层参考并修改自 [A_Share_investment_Agent](https://github.com/24mlight/A_Share_investment_Agent)（其本身改编自 [ai-hedge-fund](https://github.com/virattt/ai-hedge-fund)）。量化选股、因子体系、竞赛回测部分为本项目新增。
+核心依赖包括：
 
-许可证详见 [LICENSE](LICENSE)（原始代码 MIT，新增代码 GPL v3 + 非商业条款）。
+- `pandas`
+- `numpy`
+- `baostock`
+- `akshare`
+- `xgboost`
+- `scikit-learn`
+- `matplotlib`
+- `fastapi`
+- `langchain`
+
+## 快速运行
+
+### 1. 使用最终默认策略跑 2026 最新样本
+
+```powershell
+.\venv\Scripts\python.exe -m src.backtest_stock_agent `
+  --start 20260515 `
+  --end 20260713 `
+  --offline `
+  --interval 0 `
+  --cache-dir data\prefetch_cache `
+  --factor-cache-dir data\factor_cache `
+  --no-plot `
+  --quiet-advice `
+  --max-stocks 500 `
+  --log-dir logs\long_2026_default_final_s500
+```
+
+这条命令不显式传策略参数，因为当前默认值已经是最终验证版本：
+
+```text
+--score-method train_ic_blend
+--allocation-method score
+--position-count 3
+--max-drawdown-stop 0
+```
+
+### 2. 跑 2024 全年离线回测
+
+```powershell
+.\venv\Scripts\python.exe -m src.backtest_stock_agent `
+  --start 20240101 `
+  --end 20241231 `
+  --offline `
+  --interval 0 `
+  --cache-dir data\train_cache `
+  --factor-cache-dir data\factor_cache_train `
+  --no-plot `
+  --quiet-advice `
+  --max-stocks 500 `
+  --log-dir logs\full_2024_default_final_s500
+```
+
+### 3. 跑 2025 全年离线回测
+
+```powershell
+.\venv\Scripts\python.exe -m src.backtest_stock_agent `
+  --start 20250101 `
+  --end 20251231 `
+  --offline `
+  --interval 0 `
+  --cache-dir data\train_cache `
+  --factor-cache-dir data\factor_cache_train `
+  --no-plot `
+  --quiet-advice `
+  --max-stocks 500 `
+  --log-dir logs\full_2025_default_final_s500
+```
+
+## 常用参数
+
+| 参数 | 说明 | 当前默认 |
+|---|---|---|
+| `--score-method` | 排序方法，可选 `xgb`、`ic_blend`、`recent_ic_blend`、`train_ic_blend`、`ensemble_blend`、`adaptive_blend` | `train_ic_blend` |
+| `--allocation-method` | 资金分配方式，可选 `equal` 或 `score` | `score` |
+| `--position-count` | 每日持仓数量 | `3` |
+| `--max-drawdown-stop` | 回撤停手阈值，0 表示关闭 | `0` |
+| `--max-stocks` | 回测股票池数量限制 | 无限制 |
+| `--offline` | 只使用本地缓存，不联网 | 关闭 |
+| `--cache-dir` | K 线缓存目录 | `data/prefetch_cache` |
+| `--factor-cache-dir` | 因子缓存目录 | 无 |
+| `--no-plot` | 跳过图表生成，加快批量回测 | 关闭 |
+| `--quiet-advice` | 不在终端打印每日 JSON 建议 | 关闭 |
+
+## 因子与策略逻辑
+
+### 因子体系
+
+系统主要使用量价类因子：
+
+- 动量因子：短期和中期收益率。
+- 反转因子：短期反转收益。
+- 波动因子：价格波动、成交量波动。
+- 成交量因子：成交量均值、量比、成交量衰减。
+- 换手因子：换手率及换手均值。
+- 价量关系因子：价格与成交量、收益与成交量相关性。
+
+### 最终排序逻辑
+
+当前默认策略 `train_ic_blend` 使用训练期 IC 验证后的因子方向构造综合排序分数。相比单纯依赖 XGBoost 分数，该方法更容易解释，并且在 2024、2025、2026 多个窗口中表现更稳定。
+
+### 资金分配逻辑
+
+当前默认使用 `score` 加权：
+
+1. 每日选择综合得分最高的 3 只股票。
+2. 按得分权重分配资金。
+3. 单只股票买入数量向下取 100 股整数倍。
+4. 日终按收盘价结算并清仓。
+
+## 可解释性方案
+
+项目的可解释性分为三层：
+
+1. 因子级解释：每个候选股票得分来自明确的量价因子。
+2. 策略级解释：通过 IC、收益率、回撤、夏普、索泰诺、卡玛、胜率、盈亏比解释策略优缺点。
+3. 迭代级解释：保留策略从 XGBoost、自适应、IC blend 到 Train-IC 默认策略的验证过程，证明策略是由数据反馈驱动调整。
+
+## Agent 架构
+
+```text
+数据采集 Agent
+  -> 因子计算 Agent
+  -> 策略评估 Agent
+  -> 选股决策 Agent
+  -> 资金分配与执行 Agent
+  -> 解释与报告 Agent
+```
+
+模块职责：
+
+- 数据采集 Agent：维护 K 线缓存，支持联网拉取和离线复现。
+- 因子计算 Agent：生成量价因子和截面因子缓存。
+- 策略评估 Agent：计算 IC 和回测评价指标。
+- 选股决策 Agent：根据策略得分输出 Top 3 标的。
+- 资金分配与执行 Agent：生成买入数量和 JSON 操作建议。
+- 解释与报告 Agent：输出回测报告、指标表和作品设计书素材。
+
+## 最新产物
+
+| 文件 | 说明 |
+|---|---|
+| `作品设计书_撰写稿.md` | 当前最新作品设计书草稿 |
+| `logs/factor_analysis/final_performance_metrics.csv` | 夏普、索泰诺、卡玛、胜率、盈亏比等最终指标 |
+| `logs/factor_analysis/final_default_comparison.csv` | 最终默认策略跨窗口结果 |
+| `logs/factor_analysis/validation_report.md` | 策略验证报告 |
+| `logs/full_2024_default_final_s500/` | 2024 全年最终回测结果 |
+| `logs/full_2025_default_final_s500/` | 2025 全年最终回测结果 |
+| `logs/long_2026_default_final_s500/` | 2026 最新样本最终回测结果 |
+
+## 旧内容处理说明
+
+本 README 已更新为项目当前唯一推荐入口。早期实验内容仍可能保留在 `logs/factor_analysis/` 中，用于追溯策略迭代过程，但不再作为默认策略依据。
+
+当前最终版本只建议引用以下结论：
+
+- 默认策略：`train_ic_blend + score allocation + 3 positions`
+- 最终回测：2024 全年、2025 全年、2026 最新样本
+- 最终指标文件：`final_performance_metrics.csv`
+- 最终设计书：`作品设计书_撰写稿.md`
+
+## 风险与后续优化
+
+当前系统仍有以下限制：
+
+- 2024 全年最大回撤较高，说明市场风格切换时仍存在明显风险。
+- 当前回测未完整模拟交易成本、滑点、涨跌停无法成交等实盘约束。
+- 2026 样本目前使用本地缓存可靠覆盖区间，后续可继续补足更长 2026 数据。
+- LLM 多智能体层仍可继续增强基本面、新闻情绪和宏观分析。
+
+后续优化方向：
+
+- 增加交易成本和滑点模拟。
+- 增加市场状态识别模块。
+- 增加基本面和新闻情绪 Agent。
+- 做成交约束、涨跌停过滤和风险预算控制。
+- 将回测和每日选股报告部署到云端定时运行。
+
+## 作品展示建议
+
+海报和演示视频建议突出：
+
+- 项目不是单一模型，而是完整的量化选股 Agent 闭环。
+- 系统具备数据采集、因子计算、策略验证、资金分配、报告输出能力。
+- 项目经过负收益策略淘汰和默认策略重选，体现自动诊断和迭代能力。
+- 最终策略在 2024、2025 和 2026 最新样本中均为正收益。
+- 产品优势是可解释、可复现和风险收益比较稳健。
+
+一句话总结：
+
+> AlphaAgent 将多因子量化选股和 Agent 架构结合，通过可解释因子、离线复现、多指标回测和策略迭代，形成了一个可展示、可验证、可继续扩展的 A 股智能选股系统。

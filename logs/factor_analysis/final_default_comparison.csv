@@ -1,0 +1,9 @@
+scenario,period,days,return_pct,max_drawdown_pct,score_method,allocation_method,position_count,max_drawdown_stop,notes
+default_final,2024 full year s500,241,17.77,21.93,train_ic_blend,score,3,0,Full-year historical validation; high drawdown risk remains
+default_final,2025 full year s500,242,19.75,7.11,train_ic_blend,score,3,0,Full-year historical validation
+default_final,2026-05-18 to 2026-07-13 s500,40,1.74,5.13,train_ic_blend,score,3,0,Expanded cache-covered 2026 validation
+default_final,2026-05-18 to 2026-06-15 s500,21,0.28,4.80,train_ic_blend,score,3,0,First 2026 sub-window
+default_final,2026-06-17 to 2026-07-13 s500,18,1.80,5.13,train_ic_blend,score,3,0,Latest 2026 sub-window
+default_final,2025 Q4 s500,59,6.28,4.02,train_ic_blend,score,3,0,Historical validation window
+previous_adaptive_default,2026-05-18 to 2026-07-13 s500,40,-6.20,9.37,adaptive_blend,equal,5,0.08,Rejected after expanded validation
+ic_blend_score,2026-05-18 to 2026-07-13 s500,40,0.99,14.72,ic_blend,score,5,0,Positive but high drawdown and weak cross-window stability
