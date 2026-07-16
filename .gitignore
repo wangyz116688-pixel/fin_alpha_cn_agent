@@ -86,10 +86,29 @@ test/
 test*
 src/crawler/*.ts
 *.json
+!frontend/package.json
+!frontend/package-lock.json
+!frontend/tsconfig.json
 reports/
 
 #test
 integration/ 
 .pytest_cache/
+
+# Local Codex/demo working files
+.codex_work/
+_work/
+tmp/
+会话交接记录.md
+~$*.docx
+
+# Required frontend source folders shadowed by broad root rules above
+!frontend/build/
+!frontend/build/**
+!frontend/tests/
+!frontend/tests/**
+!tests/
+!tests/**
+tests/**/__pycache__/
 
 nul

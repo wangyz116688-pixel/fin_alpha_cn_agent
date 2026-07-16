@@ -4,7 +4,7 @@ from typing import Dict, List
 
 from .routers import logs, runs
 # 导入新增的路由器
-from .routers import agents, workflow, analysis, api_runs
+from .routers import agents, workflow, analysis, api_runs, demo
 
 # Create FastAPI app instance
 app = FastAPI(
@@ -35,6 +35,7 @@ app.include_router(agents.router)
 app.include_router(workflow.router)
 app.include_router(analysis.router)
 app.include_router(api_runs.router)
+app.include_router(demo.router)
 
 # 根端点API导航
 

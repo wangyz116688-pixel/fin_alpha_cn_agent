@@ -7,7 +7,7 @@ API状态管理模块
 import threading
 import logging
 from typing import Dict, List, Any, Optional
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, Future
 
 from .models.api_models import RunInfo
@@ -81,7 +81,7 @@ class ApiState:
                 if self._current_run_id:
                     history_entry = {
                         "run_id": self._current_run_id,
-                        "timestamp": datetime.now(UTC),
+                        "timestamp": datetime.now(timezone.utc),
                         field: data
                     }
                     self._agent_data[agent_name]["history"].append(
@@ -113,7 +113,7 @@ class ApiState:
         with self._lock:
             self._runs[run_id] = RunInfo(
                 run_id=run_id,
-                start_time=datetime.now(UTC),
+                start_time=datetime.now(timezone.utc),
                 status="running"
             )
             self._current_run_id = run_id
@@ -122,7 +122,7 @@ class ApiState:
         """完成运行"""
         with self._lock:
             if run_id in self._runs:
-                self._runs[run_id].end_time = datetime.now(UTC)
+                self._runs[run_id].end_time = datetime.now(timezone.utc)
                 self._runs[run_id].status = status
 
                 # 更新参与的Agent列表
